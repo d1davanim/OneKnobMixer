@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Settings, Check, X, Disc, Power, Radio, Zap, Play, Pause, Upload, VolumeX, Activity, Download, Save, BarChart3, ScanLine, Globe } from 'lucide-react';
+import { Settings, Check, X, Disc, Power, Radio, Zap, Play, Pause, Upload, VolumeX, Activity, Download, Save, BarChart3, Globe } from 'lucide-react';
 
 // --- Translation Dictionary ---
 const TRANSLATIONS = {
@@ -121,7 +121,7 @@ const TRANSLATIONS = {
   }
 };
 
-// --- Helper Components (Moved Outside) ---
+// --- Helper Components ---
 
 // 1. Frequency Response Chart
 const EqFrequencyResponseChart = ({ dataOriginal, dataProcessed, labels, t }) => {
@@ -340,6 +340,7 @@ export default function LaunchPadMixer() {
   const [showExportModal, setShowExportModal] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const [exportStats, setExportStats] = useState(null);
+  const [downloadProgress, setDownloadProgress] = useState(0); // Add Progress State
 
   const [tacticalConfig, setTacticalConfig] = useState({
       stealthMode: false,   
@@ -375,6 +376,7 @@ export default function LaunchPadMixer() {
     audioBufferRef.current = null;
     setShowExportModal(false);
     setExportStats(null);
+    setDownloadProgress(0);
   };
 
   const handleFileChange = (e) => {
@@ -398,67 +400,85 @@ export default function LaunchPadMixer() {
 
     setGameState('ANALYZING');
 
-    const AudioContext = window.AudioContext || window.webkitAudioContext;
-    const ctx = new AudioContext();
-    const arrayBuffer = await fileBlob.arrayBuffer();
-    const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
-    audioBufferRef.current = audioBuffer; 
-    setSourceSampleRate(audioBuffer.sampleRate); 
+    try {
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        const ctx = new AudioContext();
+        const arrayBuffer = await fileBlob.arrayBuffer();
+        
+        // --- FIX: MOV/Video Decode Error Handling ---
+        let audioBuffer;
+        try {
+            audioBuffer = await ctx.decodeAudioData(arrayBuffer);
+        } catch (decodeErr) {
+            console.error(decodeErr);
+            alert("⚠️ 无法读取此文件！\n\n原因：格式不兼容或损坏 (如 iPhone MOV HEVC 编码)。\n请尝试提取音频，或使用 MP3 / M4A / WAV 格式。");
+            setGameState('IDLE');
+            return;
+        }
 
-    const channelData = audioBuffer.getChannelData(0);
-    let peak = 0;
-    let sumSquares = 0;
-    let minLevel = 1.0; 
+        audioBufferRef.current = audioBuffer; 
+        setSourceSampleRate(audioBuffer.sampleRate); 
 
-    for (let i = 0; i < channelData.length; i+=10) { 
-        const abs = Math.abs(channelData[i]);
-        if (abs > peak) peak = abs;
-        if (abs > 0.0001 && abs < minLevel) minLevel = abs; 
-        sumSquares += abs * abs;
+        const channelData = audioBuffer.getChannelData(0);
+        let peak = 0;
+        let sumSquares = 0;
+        let minLevel = 1.0; 
+
+        // Optimized sampling (step 50) for large files
+        for (let i = 0; i < channelData.length; i+=50) { 
+            const abs = Math.abs(channelData[i]);
+            if (abs > peak) peak = abs;
+            if (abs > 0.0001 && abs < minLevel) minLevel = abs; 
+            sumSquares += abs * abs;
+        }
+        const rms = Math.sqrt(sumSquares / (channelData.length/50));
+        const crestFactor = peak / (rms + 0.0001); 
+        const isHighDynamic = crestFactor > 4.0;
+        
+        const peakDb = 20 * Math.log10(peak || 0.0001);
+        const minDb = 20 * Math.log10(minLevel || 0.0001);
+
+        const initialStats = {
+            peak: peak,
+            peakDb: peakDb,
+            minDb: Math.max(-90, minDb), 
+            rms: rms,
+            dynamicRange: peakDb - minDb
+        };
+
+        let thresholdDb, ratio, attack, release, makeupGain;
+
+        if (isHighDynamic) {
+            const targetThreshold = 20 * Math.log10(peak * 0.7);
+            thresholdDb = Math.max(-50, targetThreshold); 
+            ratio = 5;
+            attack = 0.05; 
+            release = 0.15; 
+            makeupGain = 1.0; 
+        } else {
+            const targetThreshold = 20 * Math.log10(rms * 0.9) + (20 * Math.log10(peak) * 0.1);
+            thresholdDb = Math.max(-60, targetThreshold);
+            ratio = 12;
+            attack = 0.005; 
+            release = 0.4;  
+            makeupGain = 1.1; 
+        }
+        if (thresholdDb > -10) thresholdDb = -10; 
+
+        calculatedParamsRef.current = {
+            thresholdDb, ratio, attack, release, makeupGain, initialStats
+        };
+
+        ctx.close();
+
+        setTimeout(() => {
+            setGameState('LAUNCHED');
+        }, 1000);
+
+    } catch (e) {
+        alert("未知错误，请重试。");
+        setGameState('IDLE');
     }
-    const rms = Math.sqrt(sumSquares / (channelData.length/10));
-    const crestFactor = peak / (rms + 0.0001); 
-    const isHighDynamic = crestFactor > 4.0;
-    
-    const peakDb = 20 * Math.log10(peak || 0.0001);
-    const minDb = 20 * Math.log10(minLevel || 0.0001);
-
-    const initialStats = {
-        peak: peak,
-        peakDb: peakDb,
-        minDb: Math.max(-90, minDb), 
-        rms: rms,
-        dynamicRange: peakDb - minDb
-    };
-
-    let thresholdDb, ratio, attack, release, makeupGain;
-
-    if (isHighDynamic) {
-        const targetThreshold = 20 * Math.log10(peak * 0.7);
-        thresholdDb = Math.max(-50, targetThreshold); 
-        ratio = 5;
-        attack = 0.05; 
-        release = 0.15; 
-        makeupGain = 1.0; 
-    } else {
-        const targetThreshold = 20 * Math.log10(rms * 0.9) + (20 * Math.log10(peak) * 0.1);
-        thresholdDb = Math.max(-60, targetThreshold);
-        ratio = 12;
-        attack = 0.005; 
-        release = 0.4;  
-        makeupGain = 1.1; 
-    }
-    if (thresholdDb > -10) thresholdDb = -10; 
-
-    calculatedParamsRef.current = {
-        thresholdDb, ratio, attack, release, makeupGain, initialStats
-    };
-
-    ctx.close();
-
-    setTimeout(() => {
-        setGameState('LAUNCHED');
-    }, 1500); 
   };
 
   const buildAudioGraph = (ctx, destination, buffer, offline = false) => {
@@ -700,27 +720,51 @@ export default function LaunchPadMixer() {
   const downloadAudio = async () => {
       if (!audioBufferRef.current) return;
       setIsExporting(true);
+      setDownloadProgress(0);
 
-      const originalBuffer = audioBufferRef.current;
-      const sr = originalBuffer.sampleRate; 
-      const reverbTailSeconds = 3.0; 
-      const newLength = originalBuffer.length + (sr * reverbTailSeconds);
+      // --- Progress Bar Simulation ---
+      const progressTimer = setInterval(() => {
+          setDownloadProgress(prev => {
+              if (prev >= 90) return 90; // Wait at 90%
+              return prev + 2; // Speed of bar
+          });
+      }, 100);
 
-      const offlineCtx = new OfflineAudioContext(2, newLength, sr);
-      
-      buildAudioGraph(offlineCtx, offlineCtx.destination, originalBuffer, true);
+      try {
+        const originalBuffer = audioBufferRef.current;
+        const sr = originalBuffer.sampleRate; 
+        const reverbTailSeconds = 3.0; 
+        const newLength = originalBuffer.length + (sr * reverbTailSeconds);
 
-      const renderedBuffer = await offlineCtx.startRendering();
-      const wavBlob = bufferToWave24(renderedBuffer, renderedBuffer.length);
-      const url = URL.createObjectURL(wavBlob);
-      
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = `MIXED_${fileName}_${sr/1000}k_24bit.wav`;
-      link.click();
-      
-      setIsExporting(false);
-      setShowExportModal(false);
+        const offlineCtx = new OfflineAudioContext(2, newLength, sr);
+        
+        buildAudioGraph(offlineCtx, offlineCtx.destination, originalBuffer, true);
+
+        const renderedBuffer = await offlineCtx.startRendering();
+        
+        // --- Finish Progress ---
+        clearInterval(progressTimer);
+        setDownloadProgress(100);
+
+        const wavBlob = bufferToWave24(renderedBuffer, renderedBuffer.length);
+        const url = URL.createObjectURL(wavBlob);
+        
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `MIXED_${fileName}_${sr/1000}k_24bit.wav`;
+        link.click();
+        
+        setTimeout(() => {
+            setIsExporting(false);
+            setShowExportModal(false);
+            setDownloadProgress(0);
+        }, 1500);
+
+      } catch (err) {
+        clearInterval(progressTimer);
+        setIsExporting(false);
+        alert("导出失败，内存不足。");
+      }
   };
 
   return (
@@ -766,12 +810,12 @@ export default function LaunchPadMixer() {
         }
       `}</style>
 
-      {/* Hidden File Input with Ref */}
+      {/* --- FIX: Updated Accept Attribute for iPhone/MOV --- */}
       <input 
         ref={fileInputRef}
         id="file-upload" 
         type="file" 
-        accept="audio/*" 
+        accept="audio/*,video/*,.mp3,.wav,.m4a,.mp4,.mov,.aac,.flac" 
         onChange={handleFileChange} 
         className="hidden" 
       />
@@ -793,7 +837,8 @@ export default function LaunchPadMixer() {
                 </button>
             </div>
 
-            <h1 className="text-5xl text-zinc-400 font-military tracking-widest drop-shadow-[0_2px_0_rgba(0,0,0,1)]">
+            {/* --- FIX: Responsive Text Size for EN/CN --- */}
+            <h1 className={`${lang === 'EN' ? 'text-4xl' : 'text-5xl'} text-zinc-400 font-military tracking-widest drop-shadow-[0_2px_0_rgba(0,0,0,1)] transition-all duration-300`}>
                 {t.titleMain}<span className="text-red-600">{t.titleSub}</span>
             </h1>
             <div className="text-zinc-400 font-bold font-tech mt-2 tracking-[0.3em] uppercase text-sm">{t.subtitle}</div>
@@ -807,7 +852,7 @@ export default function LaunchPadMixer() {
             <div className="relative bg-black border border-zinc-600 p-1">
                 <div className="bg-zinc-900 border border-zinc-800 p-4 flex flex-col items-center justify-center min-h-[6rem] relative overflow-hidden">
                     <div className="absolute inset-0 pointer-events-none opacity-10" 
-                        style={{backgroundImage: 'linear-gradient(0deg, transparent 24%, rgba(0, 255, 0, .3) 25%, rgba(0, 255, 0, .3) 26%, transparent 27%, transparent 74%, rgba(0, 255, 0, .3) 75%, rgba(0, 255, 0, .3) 76%, transparent 77%, transparent), linear-gradient(90deg, transparent 24%, rgba(0, 255, 0, .3) 25%, rgba(0, 255, 0, .3) 26%, transparent 27%, transparent 74%, rgba(0, 255, 0, .3) 75%, rgba(0, 255, 0, .3) 76%, transparent 77%, transparent), linear-gradient(90deg, transparent 24%, rgba(0, 255, 0, .3) 25%, rgba(0, 255, 0, .3) 26%, transparent 27%, transparent 74%, rgba(0, 255, 0, .3) 75%, rgba(0, 255, 0, .3) 76%, transparent 77%, transparent)', backgroundSize: '50px 50px'}}>
+                        style={{backgroundImage: 'linear-gradient(0deg, transparent 24%, rgba(0, 255, 0, .3) 25%, rgba(0, 255, 0, .3) 26%, transparent 27%, transparent 74%, rgba(0, 255, 0, .3) 75%, rgba(0, 255, 0, .3) 76%, transparent 77%, transparent), linear-gradient(90deg, transparent 24%, rgba(0, 255, 0, .3) 25%, rgba(0, 255, 0, .3) 26%, transparent 27%, transparent 74%, rgba(0, 255, 0, .3) 75%, rgba(0, 255, 0, .3) 76%, transparent 77%, transparent), linear-gradient(90deg, transparent 24%, rgba(0, 255, 0, .3) 25%, rgba(0, 255, 0, .3) 26%, transparent 27%, transparent 74%, rgba(0, 255, 0, .3) 75%, rgba(0, 255, 0, .3) 76%, transparent 77%, transparent), linear-gradient(90deg, transparent 24%, rgba(0, 255, 0, .3) 25%, rgba(0, 255, 0, .3) 26%, transparent 27%, transparent 74%, rgba(0, 255, 0, .3) 75%, rgba(0, 255, 0, .3) 76%, transparent 77%, transparent)', backgroundSize: '50px 50px'}}>
                     </div>
                     
                     {fileName ? (
@@ -1127,7 +1172,7 @@ export default function LaunchPadMixer() {
                     </div>
                 </div>
 
-                {/* Footer Action */}
+                {/* Footer Action - FIX: Progress Bar Added */}
                 <div className="p-6 border-t border-green-900/30 flex justify-between items-center bg-black/60">
                      <div className="text-xs font-tech font-bold text-zinc-400">
                         <div>{t.file}: {fileName}</div>
@@ -1136,10 +1181,18 @@ export default function LaunchPadMixer() {
                      <button 
                         onClick={downloadAudio}
                         disabled={isExporting}
-                        className="flex items-center gap-2 px-8 py-3 bg-green-700 hover:bg-green-600 text-black font-bold font-military tracking-widest transition-all hover:shadow-[0_0_20px_rgba(22,163,74,0.4)] disabled:opacity-50 disabled:cursor-not-allowed"
+                        className="flex items-center gap-2 px-8 py-3 bg-green-700 hover:bg-green-600 text-black font-bold font-military tracking-widest transition-all hover:shadow-[0_0_20px_rgba(22,163,74,0.4)] disabled:opacity-50 disabled:cursor-not-allowed min-w-[200px] justify-center"
                      >
                         {isExporting ? (
-                            <>{t.processing}</>
+                            <div className="w-full flex flex-col gap-1">
+                                <div className="w-full bg-black/30 h-1.5 rounded-full overflow-hidden">
+                                    <div 
+                                        className="h-full bg-green-300 shadow-[0_0_8px_#86efac] transition-all duration-300 ease-out"
+                                        style={{ width: `${downloadProgress}%` }}
+                                    ></div>
+                                </div>
+                                <span className="text-[9px] animate-pulse">PROCESSING {downloadProgress}%</span>
+                            </div>
                         ) : (
                             <>
                                 <Save className="w-5 h-5" />
@@ -1156,3 +1209,4 @@ export default function LaunchPadMixer() {
     </div>
   );
 }
+
